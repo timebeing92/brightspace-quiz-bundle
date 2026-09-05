@@ -1,0 +1,38 @@
+name: Verify Public Quiz Bundle
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Create locked environment
+        run: python scripts/bootstrap_env.py --locked
+      - name: Verify vendored runtime
+        run: .venv/bin/python scripts/vendor_from_workbench.py --check
+      - name: Verify release inputs
+        run: .venv/bin/python scripts/make_release_asset.py --check-only
+      - name: Exercise synthetic Compose and Rebind proof
+        run: >-
+          .venv/bin/python scripts/run_synthetic_journey.py
+          --output-dir "${{ runner.temp }}/synthetic-journey"
+      - name: Exercise real Unbind and all-quiz Compose route
+        run: |
+          .venv/bin/python scripts/quiz_terminal.py unbind \
+            tests/fixtures/quiz_xml/mixed_inline_itemref_and_root_bank \
+            --workspace "${{ runner.temp }}/quiz-workflow"
+          .venv/bin/python scripts/quiz_terminal.py compose \
+            "${{ runner.temp }}/quiz-workflow" --all-quizzes
