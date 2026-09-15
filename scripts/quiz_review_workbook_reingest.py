@@ -211,9 +211,13 @@ def _model_occurrence_index(model: dict[str, Any]) -> dict[tuple[str], str]:
     return {key: next(iter(values)) for key, values in candidates.items()}
 
 
-def _timestamp(value: Any, field: str, row_number: int) -> str:
+def _timestamp(
+    value: Any, field: str, row_number: int, *, required: bool = True
+) -> str | None:
     text = str(value or "").strip()
     if not text:
+        if not required:
+            return None
         raise ReingestError(f"Row {row_number} requires {field}.")
     normalized = text.replace("Z", "+00:00")
     try:
@@ -223,6 +227,30 @@ def _timestamp(value: Any, field: str, row_number: int) -> str:
     if parsed.tzinfo is None:
         raise ReingestError(f"Row {row_number} {field} must include a timezone.")
     return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _review_metadata(
+    row: dict[str, Any], row_number: int, decision: str, metadata_policy: str
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """Preserve supplied attribution; optional blanks do not invent review events."""
+    required = metadata_policy == "required"
+    reason = str(row.get("revision_reason") or "").strip() or None
+    proposer = str(row.get("proposed_by") or "").strip() or None
+    for field, value in (("revision_reason", reason), ("proposed_by", proposer)):
+        if required and value is None:
+            raise ReingestError(f"Row {row_number} requires {field}.")
+    proposed_at = _timestamp(
+        row.get("proposed_at"), "proposed_at", row_number, required=required
+    )
+    approver = approved_at = None
+    if decision in {"accepted", "rejected"}:
+        approver = str(row.get("approved_by") or "").strip() or None
+        if required and approver is None:
+            raise ReingestError(f"Row {row_number} requires approved_by.")
+        approved_at = _timestamp(
+            row.get("approved_at"), "approved_at", row_number, required=required
+        )
+    return reason, proposer, proposed_at, approver, approved_at
 
 
 def _stable_id(prefix: str, payload: Any) -> str:
@@ -273,7 +301,7 @@ def _setting_value(value: Any) -> Any:
 
 
 def _materialize_setting_decisions(
-    baseline_path: Path, edited_path: Path
+    baseline_path: Path, edited_path: Path, *, metadata_policy: str = "required"
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     baseline_has = _workbook_has_sheet(baseline_path, SETTINGS_SHEET_NAME)
     edited_has = _workbook_has_sheet(edited_path, SETTINGS_SHEET_NAME)
@@ -354,24 +382,9 @@ def _materialize_setting_decisions(
                     "one proposal so the effective value is unambiguous."
                 )
             proposed_settings[setting_target] = row_number
-            reason = str(edited.get("revision_reason") or "").strip()
-            proposer = str(edited.get("proposed_by") or "").strip()
-            if not reason:
-                raise ReingestError(f"Quiz Settings row {row_number} requires revision_reason.")
-            if not proposer:
-                raise ReingestError(f"Quiz Settings row {row_number} requires proposed_by.")
-            proposed_at = _timestamp(
-                edited.get("proposed_at"), "proposed_at", row_number
+            reason, proposer, proposed_at, approver, approved_at = _review_metadata(
+                edited, row_number, decision_status, metadata_policy
             )
-            approver = None
-            approved_at = None
-            if decision_status in {"accepted", "rejected"}:
-                approver = str(edited.get("approved_by") or "").strip()
-                if not approver:
-                    raise ReingestError(f"Quiz Settings row {row_number} requires approved_by.")
-                approved_at = _timestamp(
-                    edited.get("approved_at"), "approved_at", row_number
-                )
             value = _setting_value(edited.get("proposed_value"))
             decision_identity = {
                 "target_entity_key": target_entity_key,
@@ -521,8 +534,11 @@ def _question_sheet_inputs(
 
 
 def materialize_workbook_decisions(
-    model_path: Path, baseline_path: Path, edited_path: Path
+    model_path: Path, baseline_path: Path, edited_path: Path, *,
+    metadata_policy: str = "required",
 ) -> dict[str, Any]:
+    if metadata_policy not in {"required", "optional"}:
+        raise ReingestError(f"Unknown review metadata policy: {metadata_policy!r}.")
     model = json.loads(model_path.read_text(encoding="utf-8"))
     model_issues = validate_contract(model, mode="transform")
     if model_issues:
@@ -618,20 +634,9 @@ def materialize_workbook_decisions(
             raise ReingestError(f"Row {row_number} has a decision but no proposed revision.")
 
         if revisions:
-            reason = str(edited.get("revision_reason") or "").strip()
-            proposer = str(edited.get("proposed_by") or "").strip()
-            if not reason:
-                raise ReingestError(f"Row {row_number} requires revision_reason.")
-            if not proposer:
-                raise ReingestError(f"Row {row_number} requires proposed_by.")
-            proposed_at = _timestamp(edited.get("proposed_at"), "proposed_at", row_number)
-            approver = None
-            approved_at = None
-            if decision in {"accepted", "rejected"}:
-                approver = str(edited.get("approved_by") or "").strip()
-                if not approver:
-                    raise ReingestError(f"Row {row_number} requires approved_by.")
-                approved_at = _timestamp(edited.get("approved_at"), "approved_at", row_number)
+            reason, proposer, proposed_at, approver, approved_at = _review_metadata(
+                edited, row_number, decision, metadata_policy
+            )
 
             for header in revisions:
                 value = edited.get(header)
@@ -692,7 +697,8 @@ def materialize_workbook_decisions(
         if reviewer_note and baseline.get("reviewer_note") != edited.get("reviewer_note"):
             actor = str(edited.get("proposed_by") or "").strip() or None
             timestamp = (
-                _timestamp(edited.get("proposed_at"), "proposed_at", row_number)
+                _timestamp(edited.get("proposed_at"), "proposed_at", row_number,
+                           required=metadata_policy == "required")
                 if edited.get("proposed_at")
                 else None
             )
@@ -733,7 +739,7 @@ def materialize_workbook_decisions(
         )
 
     settings_decisions, settings_inputs, settings_row_diffs = _materialize_setting_decisions(
-        baseline_path, edited_path
+        baseline_path, edited_path, metadata_policy=metadata_policy
     )
 
     test_model = deepcopy(model)
@@ -802,10 +808,15 @@ def main() -> int:
     parser.add_argument("--baseline-workbook", required=True)
     parser.add_argument("--edited-workbook", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--metadata-policy", choices=("required", "optional"), default="required",
+        help="Require review attribution/reason/dates, or preserve missing values as null."
+    )
     args = parser.parse_args()
     try:
         result = materialize_workbook_decisions(
-            Path(args.model), Path(args.baseline_workbook), Path(args.edited_workbook)
+            Path(args.model), Path(args.baseline_workbook), Path(args.edited_workbook),
+            metadata_policy=args.metadata_policy,
         )
     except (OSError, json.JSONDecodeError, ReingestError) as exc:
         print(f"error: {exc}", file=sys.stderr)

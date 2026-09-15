@@ -28,7 +28,9 @@ python3.13 scripts/bootstrap_env.py --locked
 
 The wizard is the recommended interface. It shows the exact source and output
 paths, explains each stop, lets a reviewer choose one, several, or all quizzes
-by title, and asks for confirmation before Unbind, Compose, or Rebind.
+by title, and asks for confirmation before Unbind, Compose, or Rebind. You can
+resume a ready Compose result directly with **Rebind**, or choose **Quit**.
+Closing terminal input cancels the prompt without accepting its default.
 
 The same workflow is scriptable:
 
@@ -52,6 +54,11 @@ Unbind preserves two workbook copies: edit
 `compose/reviewer_working.xlsx` and leave
 `compose/reviewer_baseline_DO_NOT_EDIT.xlsx` unchanged. Compose compares them
 so extracted source evidence cannot be silently replaced by reviewer text.
+Names, reasons and dates are optional in Quiz Workshop. Supplied metadata is
+retained; only explicit accepted decisions are applied. Choose the required
+policy in the wizard or pass `compose --metadata-policy required` when complete
+attribution is needed. Rebind verifies the recorded workbook and Compose file
+hashes before building; changed inputs require a new Compose run.
 
 The workbook's primary surfaces are `All Questions` and `Quiz Occurrences`.
 They show every library question, quiz use, direct or inferred library
@@ -101,9 +108,12 @@ development corpus or any real course export.
 
 ```bash
 .venv/bin/python scripts/vendor_from_workbench.py --check
-.venv/bin/python -m pytest
 .venv/bin/python scripts/make_release_asset.py --check-only
 ```
+
+The public runtime carries the built-in synthetic proof, not the private test
+corpus. Run the full `python -m pytest` suite in the development repository.
+See [release changes and boundaries](CHANGELOG.md).
 
 The release is licensed under AGPL-3.0-or-later, with commercial terms
 available by agreement. See [LICENSE](LICENSE),

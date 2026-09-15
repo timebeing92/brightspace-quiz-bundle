@@ -29,6 +29,11 @@ several, or all quizzes for Compose, and pauses before both Compose and
 Rebind. Return accepts a displayed default. A dragged terminal path may be
 quoted or contain escaped spaces.
 
+Choose **Rebind an already reviewed, ready quiz** to resume a previous ready
+Compose result directly. Select the quiz and a new/empty package folder, then
+confirm the build. Choose **Quit** to close the wizard. End-of-input cancels
+with exit code 2; Ctrl-C exits with code 130. Neither accepts a confirmation.
+
 Unbind deliberately extracts all quizzes and parses the complete available
 Question Library. In D2L exports, quiz XML can hold placements or references
 while reusable question bodies live in `questiondb.xml`; narrowing extraction
@@ -69,6 +74,18 @@ omit `--quiz-entity-key` only when exactly one selected quiz is ready.
 
 ## What Compose does and does not approve
 
+Quiz Workshop defaults to `--metadata-policy optional`: revision reasons,
+proposer/approver names and timestamps may be blank. Missing values stay null;
+supplied dates must be valid. Select `required` in the wizard or pass
+`--metadata-policy required` for complete attribution. The underlying generic
+workbook importer retains its original required default for other consumers.
+The selected policy is recorded in the Compose state and summary.
+
+Blank approval status means open. Only explicit accepted decisions are applied;
+rejected proposals remain excluded. Source, identity, supported-content and
+settings checks apply under either policy. This policy concerns revision
+intake; fresh question/library authoring remains a separate input contract.
+
 Extracted questions remain evidence until their instance-level build support
 passes the pinned capability registry. Compose never upgrades that evidence by
 preference. A `NOT READY` result is a completed and useful stop: its report
@@ -82,6 +99,22 @@ readiness/build refusal.
 The optional `--phase5-candidate-authorization` is an advanced, exact-bound,
 time-limited local trial route. It is not import or round-trip evidence and is
 never created automatically by the terminal.
+
+Status and Rebind re-hash the Compose workbook and generated artifacts. Editing
+the workbook, promoted model, settings or readiness report makes that result
+stale: run Compose again. Existing rc.6 workspaces with complete recorded hashes
+remain usable; missing records require recomposition. A workbook save that only
+changes formatting also changes its hash. Compose reads the workbook without
+rewriting reviewer formatting or hidden rows/columns.
+
+## Scope of this release
+
+The real-export interface is the guided, line-oriented terminal. The separate
+full-screen TUI remains a synthetic proof. The course-specific grouped review
+adapter, rich-math display/revision transport, typed-equation conversion and
+deterministic Word intake are separate adoption work; this release does not
+claim those capabilities. Existing rich content and source evidence follow the
+pinned producer's current fidelity and readiness rules.
 
 ## Sharing boundary
 

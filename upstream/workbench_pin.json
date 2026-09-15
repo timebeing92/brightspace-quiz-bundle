@@ -107,7 +107,7 @@
       "target": "scripts/quiz_review_station.py"
     },
     {
-      "sha256": "ae2c0d30bbf38364150a8405567a8a81edbe3e64f759cf7069bf86e153cde07b",
+      "sha256": "4f55385af8e90c3eccb8f615b907b83f04d5cb6f3e404f7010637ded64cb3479",
       "source": "scripts/quiz_review_workbook_reingest.py",
       "target": "scripts/quiz_review_workbook_reingest.py"
     },
@@ -245,7 +245,7 @@
   "policy": "byte-identical mechanical promotion; behavior changes upstream first",
   "schema": "coursecraft.workbench_vendor_pin/1",
   "source_branch": "main",
-  "source_commit": "2c707d7be769042492b8d96b3f9d378987cbcabf",
-  "source_committed_at": "2026-09-04T23:27:00-04:00",
+  "source_commit": "278889ecef26748af664544eca0c4d07dbac5f3b",
+  "source_committed_at": "2026-09-15T16:52:21-04:00",
   "source_repository": "https://github.com/timebeing92/coursecraft-workbench.git"
 }

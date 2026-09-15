@@ -196,21 +196,13 @@ def fact(label: str, value: object) -> None:
 
 def prompt_text(label: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
-    try:
-        answer = input(f"  ? {label}{suffix}: ").strip()
-    except EOFError:
-        print()
-        return default
+    answer = input(f"  ? {label}{suffix}: ").strip()
     return answer or default
 
 
 def confirm(label: str, *, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
-    try:
-        answer = input(f"  ? {label} {suffix} ").strip().lower()
-    except EOFError:
-        print()
-        return default
+    answer = input(f"  ? {label} {suffix} ").strip().lower()
     if not answer:
         return default
     return answer in {"y", "yes"}
@@ -402,6 +394,28 @@ def verify_workspace(root: Path, state: dict[str, Any]) -> dict[str, Any]:
     return verification
 
 
+def verify_compose_artifacts(root: Path, compose: dict[str, Any]) -> None:
+    """Require the workbook and generated evidence from the exact Compose run."""
+    records = [compose.get(key) for key in (
+        "edited_workbook", "decision_overlay", "promoted_model",
+        "promotion_receipt", "summary_markdown",
+    )]
+    for result in compose.get("results", []):
+        records.extend(result.get(key) for key in (
+            "settings_receipt", "readiness_json", "readiness_markdown",
+        ))
+    if compose.get("phase5_candidate_authorization"):
+        records.append(compose["phase5_candidate_authorization"])
+    for record in records:
+        if not isinstance(record, dict) or not record.get("sha256"):
+            raise WorkflowError("Compose evidence is incomplete; run Compose again")
+        path = inside(root, record.get("path"))
+        if not path.is_file() or sha256_file(path) != record["sha256"]:
+            raise WorkflowError(
+                f"Compose input or artifact changed: {record['path']}; run Compose again"
+            )
+
+
 def show_status(workspace_value: str | Path) -> dict[str, Any]:
     root, state = load_state(workspace_value)
     verification = verify_workspace(root, state)
@@ -412,6 +426,8 @@ def show_status(workspace_value: str | Path) -> dict[str, Any]:
     fact("Working workbook", root / state["review"]["working"]["path"])
     compose = state.get("compose")
     if compose:
+        verify_compose_artifacts(root, compose)
+        fact("Review metadata", compose.get("metadata_policy", "required"))
         fact("Selected quizzes", len(compose["results"]))
         fact("Ready to Rebind", compose["ready_count"])
         fact("Need review", compose["not_ready_count"])
@@ -513,6 +529,7 @@ def compose_workspace(
     quiz_entity_keys: list[str],
     edited_workbook: str | Path | None = None,
     phase5_candidate_authorization: str | Path | None = None,
+    metadata_policy: str = "optional",
 ) -> dict[str, Any]:
     root, state = load_state(workspace_value)
     verify_workspace(root, state)
@@ -552,7 +569,9 @@ def compose_workspace(
     readiness_dir = generated / "readiness"
     readiness_dir.mkdir(exist_ok=True)
 
-    overlay = materialize_workbook_decisions(model_path, baseline, edited)
+    overlay = materialize_workbook_decisions(
+        model_path, baseline, edited, metadata_policy=metadata_policy,
+    )
     write_json(overlay_path, overlay)
     promoted, promotion = promote_revisions(model_path, overlay_path, REGISTRY)
     write_json(promoted_path, promoted)
@@ -619,6 +638,7 @@ def compose_workspace(
                 "# Quiz Compose Summary",
                 "",
                 f"- Selected quizzes: `{len(results)}`",
+                f"- Review metadata policy: `{metadata_policy}`",
                 f"- Ready to Rebind: `{ready_count}`",
                 f"- Need review: `{len(results) - ready_count}`",
                 "",
@@ -635,6 +655,7 @@ def compose_workspace(
 
     compose = {
         "composed_at": utc_now(),
+        "metadata_policy": metadata_policy,
         "quiz_entity_keys": quiz_entity_keys,
         "edited_workbook": _artifact(root, edited),
         "decision_overlay": _artifact(root, overlay_path),
@@ -657,6 +678,7 @@ def compose_workspace(
     save_state(root, state)
 
     fact("Selected quizzes", len(results))
+    fact("Review metadata", metadata_policy)
     fact("Accepted revisions", compose["accepted_change_count"])
     fact("Accepted settings", compose["accepted_setting_input_count"])
     fact("Ready to Rebind", ready_count)
@@ -712,6 +734,7 @@ def rebind_workspace(
         raise WorkflowError(
             "more than one selected quiz is ready; pass --quiz-entity-key for one package"
         )
+    verify_compose_artifacts(root, compose)
     promoted = inside(root, compose["promoted_model"]["path"])
     promotion = inside(root, compose["promotion_receipt"]["path"])
     settings = inside(root, selected["settings_receipt"]["path"])
@@ -897,11 +920,19 @@ def _wizard_compose() -> int:
     fact("Selected quizzes", len(keys))
     for key in keys:
         _wrap(f"• {quizzes_by_key[key]}", "    ")
-    _wrap("Compose reads only explicit reviewer columns. Extracted source cells must remain unchanged; accepted changes require proposer and approver metadata.")
+    _wrap("Compose reads explicit reviewer proposals. Keep extracted source cells unchanged. Blank approval status leaves a proposal open; only an explicit accepted decision can be applied.")
+    metadata_policy = choose(
+        "How should descriptive review metadata be handled?",
+        [
+            ("optional", "Allow blank names, reasons and dates"),
+            ("required", "Require proposer, reason, dates and decision attribution"),
+        ],
+        default="optional",
+    )
     if not confirm("Has review and approval been saved in the working workbook?", default=False):
         print("  Compose paused. The workspace is ready when review is complete.")
         return 0
-    result = compose_workspace(root, quiz_entity_keys=keys)
+    result = compose_workspace(root, quiz_entity_keys=keys, metadata_policy=metadata_policy)
     ready = [row for row in result["compose"]["results"] if row["ready"]]
     if ready and confirm("Run local Rebind for a ready quiz now?", default=False):
         if len(ready) == 1:
@@ -919,6 +950,35 @@ def _wizard_compose() -> int:
     return 0
 
 
+def _wizard_rebind() -> int:
+    root = path_from_user(prompt_text("Quiz workflow folder"))
+    _, state = load_state(root)
+    verify_workspace(root, state)
+    compose = state.get("compose") or {}
+    ready = [row for row in compose.get("results", []) if row.get("ready")]
+    if not ready:
+        raise WorkflowError("Rebind is unavailable because no selected quiz is ready; run Compose first")
+    verify_compose_artifacts(root, compose)
+    key = choose(
+        "Which ready quiz should become one local package?",
+        [(row["quiz_entity_key"], row["title"]) for row in ready],
+        default=ready[0]["quiz_entity_key"],
+    )
+    selected = next(row for row in ready if row["quiz_entity_key"] == key)
+    output = path_from_user(prompt_text(
+        "New package folder", str(root / "rebind" / safe_label(selected["title"])),
+    ))
+    heading("Ready to Rebind")
+    fact("Quiz", selected["title"])
+    fact("Writes", output)
+    _wrap("The package will be built and validated locally. Brightspace import remains a separate step.")
+    if not confirm("Build this local package?", default=False):
+        print("  Canceled; nothing was written.")
+        return 0
+    rebind_workspace(root, quiz_entity_key=key, output_dir=output)
+    return 0
+
+
 def interactive_wizard() -> int:
     print()
     print("  QUIZ WORKSHOP")
@@ -932,6 +992,8 @@ def interactive_wizard() -> int:
             ("compose", "Continue a reviewed workflow with Compose"),
             ("status", "Verify and summarize an existing workflow"),
             ("proof", "Open the advanced synthetic full-screen proof"),
+            ("rebind", "Rebind an already reviewed, ready quiz"),
+            ("quit", "Quit"),
         ],
         default="unbind",
     )
@@ -941,6 +1003,11 @@ def interactive_wizard() -> int:
         return _wizard_compose()
     if action == "status":
         show_status(prompt_text("Quiz workflow folder"))
+        return 0
+    if action == "rebind":
+        return _wizard_rebind()
+    if action == "quit":
+        print("  Quiz Workshop closed.")
         return 0
     from quiz_binder_tui import main as proof_main
 
@@ -986,6 +1053,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     compose.add_argument("--edited-workbook")
     compose.add_argument("--phase5-candidate-authorization")
+    compose.add_argument(
+        "--metadata-policy", choices=("optional", "required"), default="optional",
+        help="allow blank review attribution (default), or require complete metadata",
+    )
 
     rebind = subparsers.add_parser("rebind", help="build only an authoring-ready Compose result")
     rebind.add_argument("workspace")
@@ -1032,6 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
                 quiz_entity_keys=quiz_entity_keys,
                 edited_workbook=args.edited_workbook,
                 phase5_candidate_authorization=args.phase5_candidate_authorization,
+                metadata_policy=args.metadata_policy,
             )
         elif args.command == "rebind":
             rebind_workspace(
@@ -1043,6 +1115,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n  Canceled. No completion claim was recorded.", file=sys.stderr)
         return 130
+    except EOFError:
+        print("\n  Input closed. Canceled without accepting a default confirmation.", file=sys.stderr)
+        return 2
     except (WorkflowError, UnbindRefused, UnbindFailed, ReingestError, PromotionError, OSError, ValueError) as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
         return 2

@@ -8,7 +8,7 @@
       "type": "application",
       "bom-ref": "pkg:github/timebeing92/brightspace-quiz-bundle@0.1.0-rc.6",
       "name": "brightspace-quiz-bundle",
-      "version": "0.1.0-rc.6",
+      "version": "0.1.0-rc.7",
       "purl": "pkg:github/timebeing92/brightspace-quiz-bundle@0.1.0-rc.6"
     }
   },

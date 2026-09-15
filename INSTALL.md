@@ -1,6 +1,6 @@
 # Installation
 
-Quiz Bundle `0.1.0-rc.6` uses a local Python virtual environment and direct,
+Quiz Bundle `0.1.0-rc.7` uses a local Python virtual environment and direct,
 inspectable script entry points. It is not a background service and does not
 contact Brightspace during installation or use.
 
@@ -51,6 +51,17 @@ Run the wizard again and choose **Continue a reviewed workflow with Compose**
 after proposals and approvals are saved. Compose can check one, several, or all
 quizzes and produces a separate readiness report for each. Rebind is offered
 one quiz/package at a time only when that exact report is ready.
+
+Choose **Rebind an already reviewed, ready quiz** to resume that stage later.
+The wizard checks the prior Compose files, lets you select a ready quiz and a
+new output folder, and confirms the local build. **Quit** closes the wizard.
+
+Review names, reasons and dates may be blank by default. Explicit acceptance is
+still required to apply a revision; missing metadata never creates acceptance.
+Choose the required metadata policy in Compose if your review process needs it.
+Saving workbook changes after Compose requires another Compose run before
+Rebind. The tool checks file hashes, so even a presentation-only save counts as
+a changed workbook; current row/column visibility is not rewritten by Compose.
 
 Unbind itself defaults to the complete export: all quizzes and the available
 Question Library are parsed together. This is necessary because quiz XML often
