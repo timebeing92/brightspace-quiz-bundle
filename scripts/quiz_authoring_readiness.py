@@ -17,9 +17,12 @@ from quiz_build_support import (
     load_capability_registry,
     load_settings_receipt,
     question_projection_issues,
+    question_asset_reference_issues,
+    projected_bank_id,
     resolve_projection_relationships,
     resolve_model_asset,
     sha256_file,
+    target_identifier_issues,
 )
 from quiz_contracts import validate_contract
 from quiz_phase5_authorization import verify_candidate_authorization
@@ -275,8 +278,10 @@ def analyze_authoring_readiness(
 
     selected_pools: set[str] = set()
     selected_questions: list[dict[str, Any]] = []
+    projected_banks: list[tuple[str, str]] = []
+    projected_draws: list[tuple[int, str, str]] = []
     question_draws: dict[str, list[str]] = {}
-    for draw in draws:
+    for draw_index, draw in enumerate(draws, start=1):
         draw_key = draw["entity_key"]
         if draw["selection"]["mode"] != "random":
             issues.append(
@@ -318,6 +323,9 @@ def analyze_authoring_readiness(
             continue
         pool_key = pool["entity_key"]
         selected_pools.add(pool_key)
+        bank_id = projected_bank_id(pool, draw_index)
+        projected_banks.append((bank_id, pool_key))
+        projected_draws.append((draw["ordinal"] if draw["ordinal"] is not None else draw_index, bank_id, draw_key))
         members = [
             questions[row["from_entity_key"]]
             for row in resolved
@@ -461,6 +469,14 @@ def analyze_authoring_readiness(
                 )
             )
     report["question_capabilities"] = dict(sorted(capability_counts.items()))
+    for code, message, owner in target_identifier_issues(
+        [(question["identity"]["permanent_code"], key) for key, question in sorted(unique_questions.items())
+         if question["identity"].get("permanent_code")],
+        projected_banks,
+        projected_draws,
+    ):
+        issues.append(_issue("error", code, message, entity_key=owner,
+                             remediation="Review target identifier collisions; preserve canonical identities and supply distinct approved codes before generation."))
     for code, keys in sorted(permanent_codes.items()):
         if len(keys) > 1:
             issues.append(
@@ -474,6 +490,7 @@ def analyze_authoring_readiness(
 
     root = (asset_root or model_path.parent).resolve()
     asset_keys: set[str] = set()
+    resolved_assets: dict[str, dict[str, Any]] = {}
     package_paths: dict[str, tuple[str, str]] = {}
     for relation in model["relationships"]:
         if relation["kind"] != "uses_asset" or relation["from_entity_key"] not in unique_questions:
@@ -515,6 +532,7 @@ def analyze_authoring_readiness(
             )
             continue
         asset_keys.add(asset["entity_key"])
+        resolved_assets[asset["entity_key"]] = resolved_asset
         path = resolved_asset["archive_path"].as_posix()
         previous = package_paths.get(path)
         current = (asset["entity_key"], resolved_asset["sha256"])
@@ -530,6 +548,11 @@ def analyze_authoring_readiness(
             )
         package_paths[path] = current
     report["summary"]["selected_asset_count"] = len(asset_keys)
+    for code, message, owner in question_asset_reference_issues(
+        list(unique_questions.values()), list(resolved_assets.values()), model["relationships"]
+    ):
+        issues.append(_issue("error", code, message, entity_key=owner,
+                             remediation="Bind each local HTML reference to exactly one resolved in-root asset at the unchanged package path, or review the unsupported delivery profile."))
 
     if model["source"]["source_lineage_key"].startswith("cc:lineage:unresolved:"):
         issues.append(

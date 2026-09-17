@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import html
 import json
 import shutil
 import sys
@@ -23,7 +24,9 @@ from quiz_build_support import (
     default_settings_receipt,
     load_authoring_projection,
     materialize_effective_settings_receipt,
+    safe_ident,
     sha256_file,
+    target_identifier_issues,
 )
 
 
@@ -55,21 +58,6 @@ def normalized_header(value: object) -> str:
     return clean(value).lower().replace(" ", "_").replace("-", "_")
 
 
-def safe_ident(value: str, prefix: str = "ID") -> str:
-    cleaned = []
-    for char in value.upper():
-        if char.isalnum():
-            cleaned.append(char)
-        else:
-            cleaned.append("_")
-    ident = "_".join(part for part in "".join(cleaned).split("_") if part)
-    if not ident:
-        ident = prefix
-    if ident[0].isdigit():
-        ident = f"{prefix}_{ident}"
-    return ident
-
-
 def stable_uuid(value: str) -> str:
     return str(uuid.uuid5(UUID_NAMESPACE, value))
 
@@ -90,7 +78,14 @@ def truthy(value: str) -> bool:
     return clean(value).upper() in {"TRUE", "YES", "Y", "1"}
 
 
-def html_fragment(value: str) -> str:
+def html_fragment(value: str, content_format: str | None = None) -> str:
+    # Explicit canonical formats outrank the legacy workbook HTML heuristic.
+    if content_format == "plain_text":
+        return f"<p>{html.escape(value, quote=False)}</p>" if value else ""
+    if content_format in {"html", "xhtml"}:
+        return value
+    if content_format is not None:
+        raise ValueError(f"Content format {content_format!r} requires a reviewed package conversion.")
     value = clean(value)
     if not value:
         return ""
@@ -140,6 +135,9 @@ class QuestionRow:
     evaluator_answer_key: str
     notes: str
     label: str
+    question_text_format: str | None = None
+    option_formats: list[str] | None = None
+    evaluator_answer_key_format: str | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +180,9 @@ def question_from_projection(row: dict) -> QuestionRow:
         evaluator_answer_key=row["evaluator_answer_key"],
         notes=row["notes"],
         label=f"QUES_{safe_ident(question_code, 'Q')}",
+        question_text_format=row.get("question_text_format"),
+        option_formats=row.get("option_formats"),
+        evaluator_answer_key_format=row.get("evaluator_answer_key_format"),
     )
 
 
@@ -391,7 +392,8 @@ def add_choice_question(
         # True/False labels stay bare and use text/plain. A 2026-07-20 tenant
         # probe showed that text/html was reinterpreted as a localization key.
         # Multiple-choice option text remains <p>-wrapped HTML.
-        option_markup = option_text if question.target_question_type == "TRUEFALSE" else html_fragment(option_text)
+        option_format = question.option_formats[index - 1] if question.option_formats is not None else None
+        option_markup = option_text if question.target_question_type == "TRUEFALSE" else html_fragment(option_text, option_format)
         option_texttype = (
             true_false_answer_texttype
             if question.target_question_type == "TRUEFALSE"
@@ -474,7 +476,7 @@ def add_written_response(flow: ET.Element, item: ET.Element, question: QuestionR
     answer_key_material = ET.SubElement(answer_key, "answer_key_material")
     flow_mat = ET.SubElement(answer_key_material, "flow_mat")
     material = ET.SubElement(flow_mat, "material")
-    ET.SubElement(material, "mattext", {"texttype": "text/html"}).text = html_fragment(answer_text)
+    ET.SubElement(material, "mattext", {"texttype": "text/html"}).text = html_fragment(answer_text, question.evaluator_answer_key_format)
 
 
 def create_item(
@@ -528,7 +530,7 @@ def create_item(
     presentation = ET.SubElement(item, "presentation")
     flow = ET.SubElement(presentation, "flow")
     material = ET.SubElement(flow, "material")
-    ET.SubElement(material, "mattext", {"texttype": "text/html"}).text = html_fragment(question.question_text)
+    ET.SubElement(material, "mattext", {"texttype": "text/html"}).text = html_fragment(question.question_text, question.question_text_format)
 
     if question.target_question_type in {"MULTICHOICE", "MULTISELECT", "TRUEFALSE"}:
         add_choice_question(
@@ -867,8 +869,6 @@ def build_package(args: argparse.Namespace) -> Path:
             f"Output directory is not empty ({preview}{remainder}). Use a new directory or pass "
             "--allow-nonempty-output and run strict package validation to guard against stale files."
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     authoring_projection = None
     assets: list[dict] = []
     if source_path.suffix.lower() == ".json":
@@ -965,6 +965,14 @@ def build_package(args: argparse.Namespace) -> Path:
 
     if len({question.question_code for question in questions}) != len(questions):
         raise ValueError("Question permanent codes/question_code values must be unique in one build.")
+    identifier_issues = target_identifier_issues(
+        [(row.question_code, f"question-row:{index}") for index, row in enumerate(questions)],
+        [(row.bank_id, row.bank_id) for row in questions],
+        [(row.section_order, row.source_bank_id, f"section-row:{index}") for index, row in enumerate(sections)],
+    )
+    if identifier_issues:
+        raise ValueError(identifier_issues[0][1])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     copied_asset_paths: list[str] = []
     for asset in assets:

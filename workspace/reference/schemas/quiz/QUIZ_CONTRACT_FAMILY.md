@@ -26,6 +26,22 @@ The family is deliberately smaller than the list of possible review or build
 projections. XLSX, CSV, Markdown, HTML, and package XML remain human or platform
 surfaces derived from versioned JSON facts.
 
+### Fresh draft adapter interfaces
+
+`scripts/quiz_draft_intake.py` separately validates two versioned interfaces:
+
+| Interface | Schema file | Purpose |
+| --- | --- | --- |
+| `coursecraft.quiz_draft/1` | `quiz_draft_intake_schema.json` | Deterministic fresh question, response, pool and draw input; XLSX tabs map to this JSON shape. |
+| `coursecraft.quiz_draft_intake_report/1` | `quiz_draft_intake_report_schema.json` | Intake result, source/parser provenance and counts. |
+
+The adapter validates these schemas itself; the generic normalized-model
+validator remains scoped to the three contracts above. Successful intake emits
+`coursecraft.quiz/1` with every new question still `extraction_only`. This does
+not approve content or grant builder support. Required values, blank/text rules,
+numeric precision and diagnostic behavior are documented in
+`docs/project/quiz-consolidation/DETERMINISTIC_QUIZ_DRAFT_INTAKE_2026-09-16.md`.
+
 The simplified XLSX projection therefore keeps its reviewer-facing inventory
 and placement views distinct from its technical identity view. `All Questions`
 is the complete library-aware source inventory, and `Quiz Occurrences` is the

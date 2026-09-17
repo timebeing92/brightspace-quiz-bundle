@@ -18,6 +18,8 @@ PIN_SCHEMA = "coursecraft.workbench_vendor_pin/1"
 SOURCE_REMOTE = "https://github.com/timebeing92/coursecraft-workbench.git"
 
 SOURCE_FILES = (
+    "docs/project/quiz-consolidation/DETERMINISTIC_QUIZ_DRAFT_INTAKE_2026-09-16.md",
+    "docs/project/quiz-consolidation/QUIZ_PROJECTION_FIDELITY_GATES_2026-09-16.md",
     "scripts/build_quiz_package_from_workbook.py",
     "scripts/check_package_conformance.py",
     "scripts/check_quiz_authoring_readiness.py",
@@ -33,9 +35,11 @@ SOURCE_FILES = (
     "scripts/quiz_binder_strings.py",
     "scripts/quiz_build_support.py",
     "scripts/quiz_contracts.py",
+    "scripts/quiz_draft_intake.py",
     "scripts/quiz_normalization.py",
     "scripts/quiz_phase5_authorization.py",
     "scripts/quiz_promote_revisions.py",
+    "scripts/quiz_question_types.py",
     "scripts/quiz_review_projection.py",
     "scripts/quiz_review_queues.py",
     "scripts/quiz_review_station.py",
@@ -53,9 +57,11 @@ SOURCE_FILES = (
     "tests/test_quiz_authoring_readiness.py",
     "tests/test_quiz_binder_station.py",
     "tests/test_quiz_contracts.py",
+    "tests/test_quiz_draft_intake.py",
     "tests/test_quiz_normalization.py",
     "tests/test_quiz_package_builder_validator.py",
     "tests/test_quiz_phase5_authorization.py",
+    "tests/test_quiz_projection_fidelity.py",
     "tests/test_quiz_promotion.py",
     "tests/test_quiz_review_projection.py",
     "tests/test_quiz_review_queues.py",
@@ -64,6 +70,7 @@ SOURCE_FILES = (
     "tests/test_quiz_share_gate.py",
     "tests/test_quiz_short_answer_consumers.py",
     "tests/test_quiz_short_answer_projection.py",
+    "tests/test_quiz_source_choice_fidelity.py",
     "tests/test_quiz_source_response_facts.py",
     "tests/test_quiz_unbind.py",
     "tests/test_quiz_variant_control_matrix.py",
@@ -75,9 +82,11 @@ SOURCE_FILES = (
 SOURCE_TREES = (
     "tests/fixtures/quiz_authoring",
     "tests/fixtures/quiz_binder",
+    "tests/fixtures/quiz_source_choice_fidelity",
     "tests/fixtures/quiz_xml",
     "workspace/review/quiz_capability_lab_r1/fixtures/specimens",
     "workspace/reference/schemas/quiz",
+    "workspace/reference/examples/quiz_draft",
 )
 
 

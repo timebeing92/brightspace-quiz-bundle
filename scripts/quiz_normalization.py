@@ -754,6 +754,309 @@ def _single_fact_tree(
     return _fact_node(occurrence.get("node"), element_name)
 
 
+CHOICE_SOURCE_KINDS = {"multiple_choice", "true_false", "multi_select", "ordering"}
+
+
+def _choice_fact_element(node: object) -> ET.Element:
+    """Reconstruct an evidence tree without interpreting or rewriting its text."""
+    if not isinstance(node, dict):
+        raise ValueError("Missing source XML tree.")
+    checked = _fact_node(node, node.get("name"), node.get("namespace_uri"))
+    attributes = _fact_attributes(node) if checked is not None else None
+    if attributes is None or any(
+        value is not None and not isinstance(value, str)
+        for value in (node.get("raw_text"), node.get("raw_tail"))
+    ):
+        raise ValueError("Malformed source XML tree.")
+    element = ET.Element(node["qualified_name"], {
+        (f"{{{ns}}}{name}" if ns else name): value
+        for (ns, name), value in attributes.items()
+    })
+    element.text, element.tail = node["raw_text"], node["raw_tail"]
+    element.extend(_choice_fact_element(child) for child in node["children"])
+    return element
+
+
+def source_choice_projection(facts: object) -> dict[str, Any]:
+    """Recognize bounded native choice shapes, never infer keys from display text.
+
+    Rich option material and source identifiers survive even when grading cannot
+    be interpreted. Such a projection has no authoritative correctness flags.
+    The unchanged complete XML fact trees remain the recovery authority.
+    """
+    result: dict[str, Any] = {"options": [], "recognized": False,
+                              "scoring_mode": "unknown", "reason": ""}
+    try:
+        if not isinstance(facts, dict) or facts.get("schema") != "coursecraft.quiz_source_response_facts/0":
+            raise ValueError("Source response facts are missing or unsupported.")
+        kind = QUESTION_KIND_MAP.get(str(facts.get("source_question_type")), "unknown")
+        if kind not in CHOICE_SOURCE_KINDS:
+            raise ValueError("Source type is not a supported choice projection.")
+        presentation = _choice_fact_element(_single_fact_tree(facts, "presentation", "presentation"))
+        declarations = [e for e in presentation.iter() if e.tag in {"response_lid", "response_grp", "response_str"}]
+        # Collect every option first. Do not silently drop textless, duplicated,
+        # or unsupported material when the scoring shape needs human review.
+        labels = [e for e in presentation.iter() if e.tag == "response_label"]
+        content_supported = True
+        for index, label in enumerate(labels):
+            materials = [e for e in label.iter() if e.tag == "mattext"]
+            parts = [{"format": "html" if e.get("texttype") == "text/html" else "plain_text",
+                      "content": e.text or "", "extensions": {}} for e in materials]
+            supported = len(parts) == 1 and all(
+                e.tag in {"response_label", "flow_mat", "material", "mattext"}
+                for e in label.iter()
+            ) and all(e.get("texttype", "text/plain") in {"text/html", "text/plain"} and not list(e) for e in materials)
+            content_supported &= supported
+            content = parts[0] if len(parts) == 1 else {
+                "format": "html", "content": "".join(
+                    p["content"] if p["format"] == "html" else html.escape(p["content"])
+                    for p in parts), "extensions": {"coursecraft.source_material_parts": parts}}
+            result["options"].append({
+                "option_key": chr(ord("A") + index) if index < 26 else f"OPT_{index + 1}",
+                "source_ident": label.get("ident"), "content": content,
+                "correct": None, "position": None,
+            })
+        ids = [o["source_ident"] for o in result["options"]]
+        if not ids or any(not value for value in ids) or len(set(ids)) != len(ids):
+            raise ValueError("Choice response IDs must be nonempty and unique.")
+        if not content_supported:
+            raise ValueError("Choice material needs an explicit rich-content projection.")
+        if _item_metadata_value(facts, "qmd_questiontype") != facts["source_question_type"]:
+            raise ValueError("Source question-type metadata is missing, repeated, or inconsistent.")
+        if len(declarations) != 1:
+            raise ValueError("Expected exactly one native choice declaration.")
+        declaration = declarations[0]
+        expected_cardinality = "Ordered" if kind == "ordering" else "Multiple" if kind == "multi_select" else "Single"
+        if declaration.get("rcardinality") != expected_cardinality:
+            raise ValueError("Native response cardinality conflicts with the declared question type.")
+        expected_element = "response_grp" if kind == "ordering" else "response_lid"
+        if declaration.tag != expected_element:
+            raise ValueError("Unrecognized native response declaration.")
+        renderers = [e for e in declaration if e.tag == "render_choice"]
+        if len(renderers) != 1 or [e for e in renderers[0].iter() if e.tag == "response_label"] != labels:
+            raise ValueError("Choice labels do not belong to one render_choice.")
+        declaration_id = declaration.get("respident") if kind == "ordering" else declaration.get("ident")
+        if not declaration_id:
+            raise ValueError("Native response declaration has no identifier.")
+        # Require the redundant fact summaries to agree with their immutable
+        # XML trees. Consumers must not choose whichever representation fits.
+        summaries = facts.get("response_declarations", [])
+        if len(summaries) != 1 or ET.tostring(_choice_fact_element(summaries[0].get("tree"))) != ET.tostring(declaration):
+            raise ValueError("Response declaration summaries disagree with source trees.")
+        if [r.get("source_ident") for r in summaries[0].get("response_labels", [])] != ids:
+            raise ValueError("Response label summaries disagree with source trees.")
+        if facts.get("diagnostics"):
+            raise ValueError("Source response facts contain unresolved shape diagnostics.")
+        processing = _choice_fact_element(_single_fact_tree(facts, "response_processing", "resprocessing"))
+        if processing.attrib or any(e.tag not in {"outcomes", "respcondition"} for e in processing):
+            raise ValueError("Unrecognized response-processing operation.")
+        conditions = [e for e in processing if e.tag == "respcondition"]
+        recorded_conditions = facts.get("response_conditions", [])
+        if len(conditions) != len(recorded_conditions) or any(
+            ET.tostring(e) != ET.tostring(_choice_fact_element(row.get("tree")))
+            for e, row in zip(conditions, recorded_conditions)
+        ):
+            raise ValueError("Scoring summaries disagree with source trees.")
+        outcomes = [e for e in processing if e.tag == "outcomes"]
+        if len(outcomes) > 1 or any(e.attrib for e in outcomes):
+            raise ValueError("Unsupported source outcome declarations.")
+        variables: dict[str, dict[str, Decimal | None]] = {}
+        for outcome in outcomes:
+            for variable in outcome:
+                if (variable.tag != "decvar" or list(variable)
+                    or set(variable.attrib) - {"varname", "vartype", "defaultval", "minvalue", "maxvalue"}
+                    or variable.get("vartype", "Integer") not in {"Integer", "Decimal"}):
+                    raise ValueError("Unsupported source outcome variable.")
+                name = variable.get("varname", "SCORE")
+                if not name or name in variables:
+                    raise ValueError("Source outcome variable names must be unique.")
+                values = {key: Decimal(variable.get(key)) if variable.get(key) is not None else (Decimal(0) if key == "defaultval" else None)
+                          for key in ("defaultval", "minvalue", "maxvalue")}
+                if any(value is not None and not value.is_finite() for value in values.values()):
+                    raise ValueError("Nonfinite source outcome declaration.")
+                if (values["minvalue"] is not None and values["maxvalue"] is not None
+                    and values["minvalue"] > values["maxvalue"]):
+                    raise ValueError("Source outcome bounds conflict.")
+                variables[name] = values
+
+        def outcome_default(name: str) -> Decimal | None:
+            # QTI 1.2 XML Binding §§3.5.24/3.6.19/3.6.21 define implicit
+            # integer SCORE=0, a missing decvar defaultval=0, and setvar's
+            # omitted varname/action as SCORE/Set. Apply those defaults only
+            # inside this validated grammar, never to undeclared named counters
+            # or a conflicting explicit outcome program.
+            if name in variables:
+                return variables[name]["defaultval"]
+            return Decimal(0) if name == "SCORE" and not variables else None
+
+        def outcome_allows(name: str, *scores: Decimal) -> bool:
+            limits = variables.get(name, {})
+            return all((limits.get("minvalue") is None or value >= limits["minvalue"])
+                       and (limits.get("maxvalue") is None or value <= limits["maxvalue"])
+                       for value in scores)
+
+        def condition_parts(condition: ET.Element) -> tuple[ET.Element, ET.Element, Decimal]:
+            predicates = [e for e in condition if e.tag == "conditionvar"]
+            setters = [e for e in condition if e.tag == "setvar"]
+            if len(predicates) != 1 or len(setters) != 1 or any(e.tag not in {"conditionvar", "setvar", "displayfeedback"} for e in condition):
+                raise ValueError("Unrecognized scoring condition structure.")
+            setter = setters[0]
+            if set(condition.attrib) - {"title", "continue"} or set(setter.attrib) - {"action", "varname"} or list(setter) or predicates[0].attrib:
+                raise ValueError("Unsupported scoring condition attributes.")
+            if condition.get("continue", "No").lower() not in {"yes", "no"}:
+                raise ValueError("Unsupported scoring continuation value.")
+            value = Decimal(setter.text or "")
+            if not value.is_finite():
+                raise ValueError("Nonfinite source score.")
+            return predicates[0], setter, value
+        correct: set[str] = set()
+        positions: dict[str, int] = {}
+        if kind in {"multiple_choice", "true_false"}:
+            scores: dict[str, Decimal] = {}
+            score_variables: set[str] = set()
+            for condition in conditions:
+                predicate, setter, value = condition_parts(condition)
+                if setter.get("action", "Set") != "Set" or setter.get("varname", "SCORE") not in {"SCORE", "que_score"} or value not in {Decimal(0), Decimal(100)}:
+                    raise ValueError("Single-choice grading is not a simple zero/full-credit key.")
+                if len(predicate) != 1 or predicate[0].tag != "varequal" or list(predicate[0]):
+                    raise ValueError("Single-choice grading has an ambiguous predicate.")
+                test = predicate[0]
+                oid = test.text or ""
+                if set(test.attrib) != {"respident"} or test.get("respident") != declaration_id or oid not in ids or oid in scores:
+                    raise ValueError("Single-choice scoring IDs do not join uniquely to options.")
+                scores[oid] = value
+                score_variables.add(setter.get("varname", "SCORE"))
+            if len(score_variables) != 1 or set(variables) - score_variables:
+                raise ValueError("Single-choice grading uses conflicting outcome variables.")
+            score_variable = next(iter(score_variables))
+            if not outcome_allows(score_variable, Decimal(0), Decimal(100)):
+                raise ValueError("Source outcome bounds change the single-choice key.")
+            default = outcome_default(score_variable)
+            if default is not None and default != 0:
+                raise ValueError("Single-choice default score is not zero.")
+            if default == 0:
+                for oid in ids:
+                    scores.setdefault(oid, Decimal(0))
+            if set(scores) != set(ids):
+                raise ValueError("Single-choice scoring lacks option clauses or a supported zero default.")
+            correct = {oid for oid, score in scores.items() if score == 100}
+            if len(correct) != 1:
+                raise ValueError("Single-choice source must key exactly one option.")
+            result["scoring_mode"] = "exact"
+        elif kind == "multi_select":
+            # Recognize the established all-or-nothing conjunction shape only.
+            # No OR, numeric partial credit, or counter programs are guessed.
+            positive: list[ET.Element] = []
+            score_variables: set[str] = set()
+            positive_condition = None
+            positive_action = None
+            positive_value = None
+            fallback_condition = None
+            for condition in conditions:
+                predicate, setter, value = condition_parts(condition)
+                if setter.get("varname", "SCORE") not in {"SCORE", "que_score"}:
+                    raise ValueError("Unsupported multi-select score variable.")
+                score_variables.add(setter.get("varname", "SCORE"))
+                if value == 0 and setter.get("action", "Set") == "Set" and len(predicate) == 0:
+                    if fallback_condition is not None:
+                        raise ValueError("Multi-select contains repeated fallback conditions.")
+                    fallback_condition = condition
+                    continue
+                if (setter.get("action", "Set"), value) not in {("Set", Decimal(100)), ("Add", Decimal(1))}:
+                    raise ValueError("Unsupported multi-select grading program.")
+                positive.append(predicate)
+                positive_condition, positive_action, positive_value = condition, setter.get("action", "Set"), value
+            if len(positive) != 1:
+                raise ValueError("Multi-select must have one exact full-credit conjunction.")
+            if len(score_variables) != 1 or set(variables) - score_variables:
+                raise ValueError("Multi-select grading uses conflicting outcome variables.")
+            score_variable = next(iter(score_variables))
+            default = outcome_default(score_variable)
+            if not outcome_allows(score_variable, Decimal(0), positive_value):
+                raise ValueError("Source outcome bounds change the multi-select key.")
+            if fallback_condition is not None and (conditions[-1] is not fallback_condition
+                or positive_condition.get("continue", "No").lower() != "no"):
+                raise ValueError("Multi-select continuation changes the keyed result.")
+            if (fallback_condition is None or positive_action == "Add") and default != 0:
+                raise ValueError("Multi-select grading requires a supported zero default.")
+            terms: dict[str, bool] = {}
+            def conjunction(node: ET.Element, negated: bool = False) -> None:
+                if node.tag in {"conditionvar", "and"} and not node.attrib and not negated and len(node):
+                    for child in node:
+                        conjunction(child)
+                elif node.tag == "not" and not node.attrib and not negated and len(node):
+                    # D2L also emits multiple negative varequal siblings in one
+                    # not block; this is the exporter form already reviewed.
+                    if any(c.tag != "varequal" for c in node):
+                        raise ValueError("Unsupported multi-select negation.")
+                    for child in node:
+                        conjunction(child, True)
+                elif node.tag == "varequal" and not list(node):
+                    oid = node.text or ""
+                    if set(node.attrib) != {"respident"} or node.get("respident") != declaration_id or oid not in ids or oid in terms:
+                        raise ValueError("Multi-select scoring IDs do not join uniquely to options.")
+                    terms[oid] = not negated
+                else:
+                    raise ValueError("Unsupported multi-select predicate.")
+            conjunction(positive[0])
+            if set(terms) != set(ids) or not any(terms.values()):
+                raise ValueError("Multi-select conjunction must specify every option.")
+            correct = {oid for oid, selected in terms.items() if selected}
+            result["scoring_mode"] = "all_or_nothing"
+        else:
+            # D2L Ordering counter form: one positive and one complement for
+            # each source option, then the two canonical score assignments.
+            # Native D2L exports omit continue on this program (see the
+            # ordering_response_group corpus). That is an explicit exporter
+            # profile, not a claim that generic QTI default-No evaluates it.
+            expected_variables = {"D2L_Correct", "D2L_Incorrect", "que_score"}
+            if set(variables) != expected_variables or any(
+                variables[name]["defaultval"] != 0
+                or not outcome_allows(name, Decimal(0), Decimal(len(ids) if name != "que_score" else 1))
+                for name in expected_variables
+            ):
+                raise ValueError("Ordering requires declared zero-initialized counters and compatible bounds.")
+            continuations = [e.get("continue", "").lower() or None for e in conditions]
+            if any(value is not None for value in continuations) and (
+                any(value != "yes" for value in continuations[:-1])
+                or continuations[-1] not in {"yes", "no"}
+            ):
+                raise ValueError("Ordering continuation is outside the supported native counter profile.")
+            negative: dict[str, int] = {}
+            terminal: list[tuple[str, str, Decimal]] = []
+            for condition in conditions:
+                predicate, setter, value = condition_parts(condition)
+                if len(predicate) != 1:
+                    raise ValueError("Unsupported Ordering predicate.")
+                test = predicate[0]
+                variable = setter.get("varname")
+                if variable == "que_score" and setter.get("action", "Set") == "Set" and test.tag in {"vargte", "varequal"} and test.attrib == {"respident": "D2L_Incorrect"} and test.text == "0" and not list(test):
+                    terminal.append((test.tag, test.text, value))
+                    continue
+                target = positions if variable == "D2L_Correct" else negative if variable == "D2L_Incorrect" else None
+                if terminal:
+                    raise ValueError("Ordering score assignments must follow every counter condition.")
+                if target is None or setter.get("action") != "Add" or value != 1:
+                    raise ValueError("Unsupported Ordering score operation.")
+                if target is negative:
+                    if test.tag != "not" or test.attrib or len(test) != 1:
+                        raise ValueError("Ordering incorrect condition is not the exact complement.")
+                    test = test[0]
+                oid = test.get("respident")
+                if test.tag != "varequal" or set(test.attrib) != {"respident"} or list(test) or oid not in ids or oid in target or not re.fullmatch(r"[1-9][0-9]*", test.text or ""):
+                    raise ValueError("Ordering source IDs or positions are ambiguous.")
+                target[oid] = int(test.text)
+            if positions != negative or set(positions) != set(ids) or sorted(positions.values()) != list(range(1, len(ids) + 1)) or terminal != [("vargte", "0", Decimal(0)), ("varequal", "0", Decimal(1))]:
+                raise ValueError("Ordering grading is not a complete supported counter program.")
+        for option in result["options"]:
+            option["correct"] = option["source_ident"] in correct if kind != "ordering" else None
+            option["position"] = positions.get(option["source_ident"])
+        result["recognized"] = True
+    except (ValueError, TypeError, KeyError, AttributeError, InvalidOperation) as exc:
+        result["reason"] = str(exc)
+    return result
+
+
 def _item_metadata_value(
     facts: dict[str, Any],
     field_name: str,
@@ -1766,6 +2069,15 @@ def authored_variant_row_digest(payload: dict[str, Any]) -> str:
         _variant_text(payload.get("matching_options_text")),
         images,
     ]
+    choice_display = payload.get("source_choice_display")
+    if isinstance(choice_display, dict):
+        # Duplicate visible labels can conceal different keyed native IDs.
+        # Compare position/key semantics while excluding export-local ID text.
+        basis.append([
+            choice_display.get("recognized"),
+            [[option.get("text"), option.get("correct"), option.get("position")]
+             for option in choice_display.get("options", [])],
+        ])
     return make_content_fingerprint(basis, basis=AUTHORED_VARIANT_BASIS)["digest"]
 
 
@@ -2004,6 +2316,10 @@ def _apply_variant_equivalence(
             continue
         if bool((question.get("extensions") or {}).get("library_only")) != library_only:
             continue
+        if question.get("type_payload", {}).get("extensions", {}).get("coursecraft.source_choice_projection", {}).get("state") == "unresolved":
+            # Unknown keys must not make two authored questions look equivalent
+            # merely because both projections have null correctness flags.
+            continue
         key = str(question["entity_key"])
         fingerprint = make_content_fingerprint(
             _authored_variant_basis(question, asset_digests.get(key, [])),
@@ -2097,7 +2413,9 @@ def _type_payload(
         {
             "option_key": chr(ord("A") + index) if index < 26 else f"OPT_{index + 1}",
             "content": _formatted(choice),
-            "correct": choice in answers,
+            # Choice kinds are replaced from source facts below. Other legacy
+            # type projections remain outside this bounded choice repair.
+            "correct": None if kind in CHOICE_SOURCE_KINDS else choice in answers,
             "weight": None,
             "source_evidence_keys": evidence,
             "extensions": {},
@@ -2189,7 +2507,76 @@ def _type_payload(
     }
     if manual_answer_key is not None:
         payload["manual_answer_key"] = manual_answer_key
+    if kind in CHOICE_SOURCE_KINDS:
+        source_projection = source_choice_projection(row.get("source_response_facts"))
+        payload["options"] = [
+            {"option_key": option["option_key"], "content": option["content"],
+             "correct": option["correct"], "weight": None,
+             "source_evidence_keys": list(evidence),
+             "extensions": {"coursecraft.source_response_ident": option["source_ident"]}}
+            for option in source_projection["options"]
+        ]
+        payload["correct_order"] = [
+            {"option_key": option["option_key"], "position": option["position"],
+             "source_evidence_keys": list(evidence), "extensions": {}}
+            for option in source_projection["options"] if option["position"] is not None
+        ]
+        payload["extensions"]["coursecraft.source_choice_projection"] = {
+            "state": "known" if source_projection["recognized"] else "unresolved",
+            "reason": source_projection["reason"],
+        }
     return payload
+
+
+def _check_source_choice_occurrences(model: dict[str, Any]) -> None:
+    """Refuse a single authoritative payload when same-identity facts conflict."""
+    for question in model["questions"]:
+        if question["kind"] not in CHOICE_SOURCE_KINDS:
+            continue
+        payload = question["type_payload"]
+        legacy = [r for r in payload["raw_response_models"] if r["source_kind"].startswith(("canonical-extractor-row:", "question-library-row:"))]
+        facts = [r for r in payload["raw_response_models"] if r["source_kind"] == "d2l_qti_response_facts/0"]
+        projections = [source_choice_projection(r["payload"]) for r in facts]
+        reasons = [p["reason"] for p in projections if not p["recognized"]]
+        if len(legacy) != len(facts) or not facts or sorted(tuple(r["source_evidence_keys"]) for r in legacy) != sorted(tuple(r["source_evidence_keys"]) for r in facts):
+            reasons.append("Source response facts do not cover every occurrence exactly once.")
+        if any(QUESTION_KIND_MAP.get(str(r["payload"].get("source_question_type"))) != question["kind"] for r in facts):
+            reasons.append("Question type differs across source occurrences.")
+        signatures = {
+            json.dumps([[o["content"], o["correct"], o["position"]] for o in p["options"]], sort_keys=True)
+            for p in projections
+        }
+        conflict = len(signatures) > 1
+        if conflict:
+            reasons.append("Option material, order, or keyed source responses conflict across occurrences.")
+        if not reasons:
+            # Every occurrence now contributes evidence to the authoritative
+            # options, while each occurrence's native identifiers stay raw.
+            for option in payload["options"]:
+                option["source_evidence_keys"] = list(question["source_evidence_keys"])
+            continue
+        code = "source_choice_occurrence_conflict" if conflict else "source_choice_projection_unresolved"
+        diagnostic_id = f"diag.{code}.{_token(question['entity_key'])}"
+        model["diagnostics"].append({
+            "diagnostic_id": diagnostic_id, "severity": "error", "code": code,
+            "message": "Source choice evidence cannot support one authoritative keyed projection.",
+            "status": "open", "entity_keys": [question["entity_key"]],
+            "evidence_keys": list(question["source_evidence_keys"]),
+            "details": {"reasons": sorted(set(reasons))}, "extensions": {},
+        })
+        question["diagnostic_ids"].append(diagnostic_id)
+        payload["extensions"]["coursecraft.source_choice_projection"] = {
+            "state": "unresolved", "reason": " ".join(sorted(set(reasons))),
+        }
+        # Keep unambiguous rich option material for review, but remove all
+        # authoritative keys. Conflicting material remains in the raw records.
+        if conflict:
+            payload["options"] = []
+        for option in payload["options"]:
+            option["correct"] = None
+        payload["correct_order"] = []
+        question["scoring"]["state"] = "unresolved"
+        question["scoring"]["mode"] = "unknown"
 
 
 def _relationship(
@@ -3274,6 +3661,7 @@ def build_normalized_model(
 
     if any(row["evidence_key"] == "ev.questiondb" for row in model["evidence"]):
         build_library_question_entities(model, payload, lineage, "ev.questiondb")
+    _check_source_choice_occurrences(model)
     apply_authored_variant_identity(model)
 
     issues = validate_contract(model, mode="transform")

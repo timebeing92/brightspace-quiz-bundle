@@ -30,6 +30,7 @@ from quiz_normalization import (
     copy_resolved_assets,
     enrich_payload,
     resolve_export,
+    source_choice_projection,
     utc_now,
 )
 from quiz_review_projection import build_quiz_review_projection
@@ -1329,6 +1330,34 @@ def response_choice_texts(item: ET.Element) -> list[str]:
     return [str(info["text"]) for info in response_choice_infos(item) if str(info["text"])]
 
 
+def source_choice_display(facts: dict[str, object]) -> dict[str, object] | None:
+    """Keep readable choice text separate from source identity and rich material."""
+    if str(facts.get("source_question_type")) not in {
+        "Multiple Choice", "True/False", "Multi-Select", "Multi Select", "Multiple Response", "Ordering"
+    }:
+        return None
+    projection = source_choice_projection(facts)
+    options = []
+    for option in projection["options"]:
+        content = option["content"]
+        text = render_html_fragment(content["content"]).text if content["format"] == "html" else content["content"]
+        image_only = not text.strip()
+        if image_only:
+            parser = AssetRefExtractor()
+            parser.feed(content["content"])
+            refs = unique_preserve_order(parser.refs)
+            text = "[Image: " + ", ".join(refs) + "]" if refs else "[Source option has no readable text]"
+        options.append({"option_key": option["option_key"], "source_ident": option["source_ident"],
+                        "text": text, "correct": option["correct"], "position": option["position"], "image_only": image_only})
+    counts = Counter(str(option["text"]) for option in options)
+    show_keys = any(option["image_only"] or counts[str(option["text"])] > 1 for option in options)
+    return {"options": options, "show_keys": show_keys, "recognized": projection["recognized"], "reason": projection["reason"]}
+
+
+def _choice_display_text(option: dict[str, object], show_keys: bool) -> str:
+    return f"{option['option_key']}. {option['text']}" if show_keys else str(option["text"])
+
+
 def render_material_block(material: ET.Element | None) -> RenderedHtml:
     if material is None:
         return RenderedHtml(text="", formula_present=False, mathml_used=False)
@@ -1483,6 +1512,17 @@ def unique_preserve_order(values: list[str]) -> list[str]:
 
 def extract_correct_answer(item: ET.Element) -> dict[str, str]:
     question_type = qti_metadata(item).get("qmd_questiontype", "")
+    display = source_choice_display(extract_source_response_facts(item))
+    if display is not None:
+        if not display["recognized"]:
+            return {"correct_answer": "", "correct_response_ids": "", "correct_answer_basis": "unresolved_source_scoring"}
+        ordering = question_type == "Ordering"
+        keyed = sorted(display["options"], key=lambda option: option["position"]) if ordering else [option for option in display["options"] if option["correct"] is True]
+        return {
+            "correct_answer": " || ".join(str(option["text"]) for option in keyed),
+            "correct_response_ids": " || ".join(str(option["source_ident"]) for option in keyed),
+            "correct_answer_basis": "ordering_sequence" if ordering else "multiple_selection" if question_type in {"Multi-Select", "Multi Select", "Multiple Response"} else "single_selection",
+        }
     choice_infos = response_choice_infos(item)
     choice_lookup = {str(info["ident"]): str(info["text"]) for info in choice_infos if str(info["ident"])}
     positive_choice_ids: list[str] = []
@@ -1696,6 +1736,7 @@ def library_question_payload_row(
         "correct_answer_basis": answer_key["correct_answer_basis"],
         "correct_response_ids": answer_key["correct_response_ids"],
         "source_response_facts": extract_source_response_facts(item),
+        "source_choice_display": source_choice_display(extract_source_response_facts(item)),
         "question_image_count": len(asset_refs),
         "question_image_refs": " || ".join(asset.raw_ref for asset in asset_refs),
         "question_image_paths": " || ".join(
@@ -2155,6 +2196,7 @@ def parse_quiz_files(
                         "correct_answer": answer_key["correct_answer"],
                         "correct_answer_basis": answer_key["correct_answer_basis"],
                         "correct_response_ids": answer_key["correct_response_ids"],
+                        "source_choice_display": source_choice_display(source_response_facts),
                         "question_image_count": len(asset_refs),
                         "question_image_refs": " || ".join(asset.raw_ref for asset in asset_refs),
                         "question_image_paths": " || ".join(question_image_paths),
@@ -2209,6 +2251,7 @@ def parse_quiz_files(
                     "correct_answer_basis": answer_key["correct_answer_basis"],
                     "correct_response_ids": answer_key["correct_response_ids"],
                     "source_response_facts": source_response_facts,
+                    "source_choice_display": source_choice_display(source_response_facts),
                     "pool_ident": library.pool_ident if library else "",
                     "pool_title": library.pool_title if library else "",
                     "pool_path": library.pool_path if library else "",
@@ -2465,6 +2508,10 @@ def split_pipe_values(value: object) -> list[str]:
 
 def reviewer_response_options(question_row: dict[str, object]) -> str:
     question_type = str(question_row.get("question_type", "") or "")
+    display = question_row.get("source_choice_display")
+    if isinstance(display, dict) and display.get("options"):
+        choices = [_choice_display_text(option, bool(display["show_keys"])) for option in display["options"]]
+        return "Items to order:\n" + "\n".join(f"- {choice}" for choice in choices) if question_type == "Ordering" else "\n".join(choices)
     if question_type == "Matching":
         prompts = split_pipe_values(question_row.get("matching_prompts_text", ""))
         options = split_pipe_values(question_row.get("matching_options_text", ""))
@@ -2484,6 +2531,13 @@ def reviewer_response_options(question_row: dict[str, object]) -> str:
 
 
 def reviewer_answer_key(question_row: dict[str, object]) -> str:
+    display = question_row.get("source_choice_display")
+    if isinstance(display, dict):
+        if not display.get("recognized"):
+            return "[Unresolved source scoring — review preserved XML facts]"
+        if str(question_row.get("question_type")) == "Ordering":
+            return "\n".join(f"{option['position']}. {_choice_display_text(option, bool(display['show_keys']))}" for option in sorted(display["options"], key=lambda option: option["position"]))
+        return " || ".join(_choice_display_text(option, bool(display["show_keys"])) for option in display["options"] if option["correct"] is True)
     answer = str(question_row.get("correct_answer", "") or "").strip()
     if not answer:
         return ""
@@ -2758,6 +2812,7 @@ def build_reviewer_entity_rows(
         identity_fields = _question_identity_fields(question)
         scoring = question.get("scoring", {})
         support = question.get("build_support", {})
+        choice_unresolved = question.get("type_payload", {}).get("extensions", {}).get("coursecraft.source_choice_projection", {}).get("state") == "unresolved"
         prompt = str(raw.get("question_text") or "") or _content_text(
             question.get("prompt")
         )
@@ -2782,10 +2837,14 @@ def build_reviewer_entity_rows(
                     else _model_response_options(question)
                 ),
                 "answer_key": (
-                    reviewer_answer_key(raw) if raw else _model_answer_key(question)
+                    "[Unresolved source choice evidence — review individual occurrences]"
+                    if choice_unresolved
+                    else reviewer_answer_key(raw) if raw else _model_answer_key(question)
                 ),
                 "answer_key_state": (
-                    "authoritative"
+                    "DO NOT APPROVE - source choice evidence is unresolved"
+                    if choice_unresolved
+                    else "authoritative"
                     if len(variant_digests) <= 1
                     else (
                         f"DO NOT APPROVE - {len(variant_digests)} authored variants "
@@ -3672,7 +3731,7 @@ def write_unresolved_sheet(
 ) -> None:
     hyperlink_columns = hyperlink_columns or {}
     sheet = workbook.create_sheet(title=UNRESOLVED_SHEET_TITLE)
-    headers = list(rows[0].keys()) if rows else ["note"]
+    headers = [key for key in rows[0] if key != "source_choice_display"] if rows else ["note"]
     end_column = max(len(headers), 2)
 
     sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_column)
@@ -3802,7 +3861,7 @@ def write_workbook(output_path: Path, payload: dict[str, object], source_dir: Pa
         "Quiz Questions",
         payload["quiz_question_rows"],
         hyperlink_columns={"question_primary_image_path": "question_primary_image_absolute_path"},
-        exclude_headers={"source_response_facts"},
+        exclude_headers={"source_response_facts", "source_choice_display"},
     )
     write_sheet(
         workbook,
@@ -4194,6 +4253,13 @@ def apply_reviewer_workbook_tweaks(workbook: Workbook) -> None:
         protect_reviewer_source_sheet(all_questions)
 
     quiz_questions = workbook["Quiz Questions"]
+    # Source type is reviewer context, while stable technical joins stay intact.
+    for type_sheet in [quiz_questions, *([workbook["All Questions"]] if "All Questions" in workbook.sheetnames else [])]:
+        type_headers = [cell.value for cell in type_sheet[1]]
+        if "question_type" in type_headers:
+            type_column = get_column_letter(type_headers.index("question_type") + 1)
+            type_sheet.column_dimensions[type_column].hidden = False
+            type_sheet.column_dimensions[type_column].width = 24
     quiz_questions.freeze_panes = "D2"
     quiz_questions.sheet_view.zoomScale = 80
     configure_reviewer_print_sheet(

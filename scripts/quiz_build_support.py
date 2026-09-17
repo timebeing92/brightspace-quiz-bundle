@@ -6,13 +6,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+from html.parser import HTMLParser
 import json
 import mimetypes
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from quiz_contracts import SCHEMA_REGISTRY, validate_contract
 from quiz_phase5_authorization import (
@@ -35,6 +36,43 @@ QUIZ_SETTING_DEFAULTS: dict[str, Any] = {
     "is_forward_only": False,
 }
 SUPPORTED_QUIZ_SETTINGS = set(QUIZ_SETTING_DEFAULTS)
+
+
+def safe_ident(value: str, prefix: str = "ID") -> str:
+    """Retain the historical target spelling; callers must check collisions."""
+    ident = "_".join(part for part in "".join(
+        char if char.isalnum() else "_" for char in value.upper()
+    ).split("_") if part) or prefix
+    return f"{prefix}_{ident}" if ident[0].isdigit() else ident
+
+
+def projected_bank_id(pool: dict[str, Any], draw_index: int) -> str:
+    code = pool["identity"].get("permanent_code") or pool["entity_key"].rsplit(":", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", code).strip("_") or f"POOL_{draw_index}"
+
+
+def target_identifier_issues(
+    question_codes: list[tuple[str, str]],
+    bank_codes: list[tuple[str, str]],
+    draws: list[tuple[int, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Check the exact serialized namespaces, including normalization collisions.
+
+    Each tuple carries its source owner so repeated references to one bank are
+    allowed, but two source entities can never merge into one package object.
+    Canonical identities are neither rewritten nor inferred here.
+    """
+    candidates = [("question", f"QUES_{safe_ident(code, 'Q')}", owner) for code, owner in question_codes]
+    candidates += [("pool", f"SECT_{safe_ident(code, 'BANK')}", owner) for code, owner in bank_codes]
+    candidates += [("draw", f"RAND_{safe_ident(str(order), 'SECTION')}_{safe_ident(bank, 'BANK')}", owner)
+                   for order, bank, owner in draws]
+    owners: dict[tuple[str, str], set[str]] = {}
+    for kind, target, owner in candidates:
+        owners.setdefault((kind, target), set()).add(owner)
+    return [(f"target_{kind}_identifier_collision",
+             f"Target {kind} identifier {target!r} represents {len(values)} distinct source entities; review colliding codes before building.",
+             sorted(values)[0])
+            for (kind, target), values in sorted(owners.items()) if len(values) > 1]
 
 
 def utc_now() -> str:
@@ -136,6 +174,115 @@ def resolve_model_asset(
     }
 
 
+class _QuestionReferences(HTMLParser):
+    """Read references without rewriting authored HTML or resolving the network."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: list[tuple[str, str, str]] = []
+        self.unsupported: list[str] = []
+        self.in_style = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.in_style = self.in_style or tag == "style"
+        seen: set[str] = set()
+        for name, value in attrs:
+            if name == "xml:base" or (tag == "object" and name == "codebase"):
+                self.unsupported.append(f"{tag}.{name} cannot change package reference resolution")
+            if name in {"srcset", "imagesrcset", "srcdoc", "archive"} and value:
+                self.unsupported.append(f"{tag}.{name} needs a reviewed reference parser")
+            if name == "style" and value and re.search(r"url\s*\(|@import|\\", value, re.I):
+                self.unsupported.append("CSS references need a reviewed reference parser")
+            if name not in {"src", "href", "xlink:href", "poster", "data", "background", "action", "formaction", "altimg"}:
+                continue
+            if name == "data" and tag != "object":
+                continue
+            if name in seen:
+                self.unsupported.append(f"duplicate {tag}.{name} is ambiguous")
+            seen.add(name)
+            if tag == "base":
+                self.unsupported.append("base URLs cannot change package reference resolution")
+            self.references.append((tag, name, value or ""))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "style":
+            self.in_style = False
+
+    def handle_data(self, value: str) -> None:
+        if self.in_style and re.search(r"url\s*\(|@import|\\", value, re.I):
+            self.unsupported.append("CSS references need a reviewed reference parser")
+
+
+def question_asset_reference_issues(
+    questions: list[dict[str, Any]],
+    resolved_assets: list[dict[str, Any]],
+    relationships: list[dict[str, Any]],
+) -> list[tuple[str, str, str]]:
+    """Require each local HTML reference to join one selected, verified asset.
+
+    The match uses the exact package URI -> archive-member mapping used when
+    copying assets. Source-path resemblance is not a rewrite or a valid join.
+    External HTTP(S), mail links and fragments retain the validator's existing
+    non-packaged-reference semantics; availability/rendering is not asserted.
+    """
+    assets_by_path: dict[str, list[str]] = {}
+    for asset in resolved_assets:
+        assets_by_path.setdefault(asset["archive_path"].as_posix(), []).append(asset["entity_key"])
+    bound: dict[str, set[str]] = {}
+    for relation in relationships:
+        if relation["kind"] == "uses_asset" and relation["status"] == "resolved":
+            bound.setdefault(relation["from_entity_key"], set()).add(relation["to_entity_key"])
+    issues: list[tuple[str, str, str]] = []
+    for question in questions:
+        key = question["entity_key"]
+        payload = question["type_payload"]
+        fields = [("prompt", question.get("prompt")), ("manual_answer_key", payload.get("manual_answer_key"))]
+        fields += [(f"option[{index}]", row["content"]) for index, row in enumerate(payload["options"], 1)]
+        fields += [(f"feedback[{index}]", row["content"]) for index, row in enumerate(question.get("feedback", []), 1)]
+        for location, field in fields:
+            if not field or field["format"] not in {"html", "xhtml"}:
+                continue
+            parser = _QuestionReferences()
+            parser.feed(field["content"])
+            parser.close()
+            for reason in sorted(set(parser.unsupported)):
+                issues.append(("html_reference_projection_not_supported", f"Question {key} {location}: {reason}.", key))
+            for index, (tag, attribute, original) in enumerate(parser.references, 1):
+                where = f"Question {key} {location} reference {index} ({tag}.{attribute})"
+                try:
+                    if any(ord(char) < 32 or ord(char) == 127 for char in original) or "\\" in original:
+                        raise ValueError("control characters or backslashes make the reference unsafe")
+                    # The supported URL profile trims ASCII space only; other
+                    # ASCII controls are refused above. Unicode whitespace is
+                    # part of the path and must never alias a clean filename.
+                    value = original.strip(" ")
+                    if not value:
+                        if tag == "a" and attribute == "href":
+                            continue
+                        raise ValueError("empty media/resource reference")
+                    url = urlsplit(value)
+                    if url.scheme in {"http", "https"} or value.startswith("//"):
+                        if (not url.hostname or any(char.isspace() for char in url.hostname)
+                                or url.username is not None or url.password is not None):
+                            raise ValueError("external reference needs an unambiguous host without credentials")
+                        _ = url.port  # Access validates numeric range/syntax without network I/O.
+                        continue
+                    if attribute in {"href", "xlink:href"} and (value.startswith("#") or url.scheme == "mailto"):
+                        continue
+                    if url.scheme or url.netloc or url.path.startswith("/") or not url.path:
+                        raise ValueError("this scheme or tenant-relative reference needs an explicit supported delivery profile")
+                    member = package_member_path(url.path).as_posix()
+                except (UnicodeError, ValueError) as exc:
+                    issues.append(("unsafe_or_unsupported_html_reference", f"{where}: {exc}.", key))
+                    continue
+                matches = [owner for owner in assets_by_path.get(member, []) if owner in bound.get(key, set())]
+                if not matches:
+                    issues.append(("html_asset_reference_not_bound", f"{where} has no matching selected asset and resolved uses_asset relationship at its package path.", key))
+                elif len(matches) != 1:
+                    issues.append(("html_asset_reference_ambiguous", f"{where} matches multiple selected asset entities; resolve the asset binding explicitly.", key))
+    return issues
+
+
 def _as_bool(value: Any, setting: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -180,6 +327,29 @@ def question_projection_issues(
     kind = question["kind"]
     payload = question["type_payload"]
     options = payload["options"]
+    if payload.get("extensions", {}).get("coursecraft.source_choice_projection", {}).get("state") == "unresolved":
+        issues.append(("source_choice_projection_unresolved", f"Question {key} has unresolved source choice evidence; populated keys or build-support flags cannot authorize this projection."))
+    # The only represented feedback slot is one Written Response evaluator key.
+    # Count records, not distinct text: combining duplicates would also erase
+    # provenance/targeting. A manual key must not silently shadow feedback.
+    feedback = question.get("feedback", [])
+    answer_feedback = [row for row in feedback if row["channel"] == "answer_key"]
+    manual_key = payload.get("manual_answer_key")
+    if any(row["channel"] != "answer_key" for row in feedback):
+        issues.append(("feedback_projection_not_supported", f"Question {key} has feedback the current builder cannot preserve."))
+    if answer_feedback and (kind != "long_answer" or len(answer_feedback) != 1 or manual_key is not None):
+        issues.append(("answer_key_feedback_projection_not_supported", f"Question {key} requires one Written Response answer-key source; feedback cannot be duplicated, shadowed by a manual key, or attached to another kind."))
+    if manual_key is not None and kind != "long_answer":
+        issues.append(("manual_answer_key_projection_not_supported", f"Question {key} has a manual answer key outside Written Response."))
+    if any(not str(field.get("content", "")).strip() for field in
+           ([manual_key] if manual_key is not None else []) + [row["content"] for row in answer_feedback]):
+        issues.append(("empty_evaluator_answer_key", f"Question {key} has an empty evaluator key that the serializer would replace with fallback text."))
+    rich_fields = [prompt, payload.get("manual_answer_key"), *[row["content"] for row in options],
+                   *[row["content"] for row in question.get("feedback", [])]]
+    for field in filter(None, rich_fields):
+        if field["format"] not in {"plain_text", "html", "xhtml"} or field.get("extensions", {}).get("coursecraft.source_encoding") == "latex":
+            issues.append(("content_encoding_requires_conversion", f"Question {key} contains an explicit encoding needing a reviewed package conversion."))
+            break
     if kind in {"multiple_choice", "multi_select"}:
         if not 2 <= len(options) <= 5:
             issues.append(
@@ -202,6 +372,11 @@ def question_projection_issues(
     elif kind == "true_false":
         if len(options) != 2:
             issues.append(("invalid_true_false_options", f"Question {key} needs exactly two modeled True/False options."))
+        elif ([str(row["option_key"]).upper() for row in options] not in
+              [["A", "B"], ["T", "F"], ["TRUE", "FALSE"]]
+              or [(row["content"]["format"], row["content"]["content"]) for row in options]
+              != [("plain_text", "True"), ("plain_text", "False")]):
+            issues.append(("true_false_option_projection_not_supported", f"Question {key} must preserve the proven plain-text True then False labels and corresponding keys; custom or formatted labels cannot be discarded."))
 
     correct_keys = [str(row["option_key"]).upper() for row in options if row["correct"] is True]
     if kind in {"multiple_choice", "true_false"} and len(correct_keys) != 1:
@@ -605,6 +780,7 @@ def load_authoring_projection(
 
     projected_questions: list[dict[str, Any]] = []
     projected_sections: list[dict[str, Any]] = []
+    projected_banks: list[tuple[str, str]] = []
     selected_question_keys: set[str] = set()
     for draw_index, draw in enumerate(draws, start=1):
         if draw["selection"]["mode"] != "random":
@@ -647,8 +823,8 @@ def load_authoring_projection(
         if point_value <= 0:
             raise ValueError(f"Draw {draw['entity_key']} points_per_question must be positive.")
 
-        pool_code = pool["identity"].get("permanent_code") or pool["entity_key"].rsplit(":", 1)[-1]
-        bank_id = re.sub(r"[^A-Za-z0-9._-]+", "_", pool_code).strip("_") or f"POOL_{draw_index}"
+        bank_id = projected_bank_id(pool, draw_index)
+        projected_banks.append((bank_id, pool["entity_key"]))
         projected_sections.append(
             {
                 "section_order": draw["ordinal"] if draw["ordinal"] is not None else draw_index,
@@ -692,14 +868,9 @@ def load_authoring_projection(
             payload = question["type_payload"]
             options = payload["options"]
             correct_keys = [row["option_key"] for row in options if row["correct"] is True]
-            answer_key = ""
-            if payload.get("manual_answer_key"):
-                answer_key = payload["manual_answer_key"]["content"]
-            if not answer_key:
-                answer_key = next(
-                    (row["content"]["content"] for row in question["feedback"] if row["channel"] == "answer_key"),
-                    "",
-                )
+            answer_content = payload.get("manual_answer_key")
+            if answer_content is None:
+                answer_content = next((row["content"] for row in question["feedback"] if row["channel"] == "answer_key"), None)
             projected_questions.append(
                 {
                     "bank_id": bank_id,
@@ -713,17 +884,28 @@ def load_authoring_projection(
                     "scoring_policy": "ALL_OR_NOTHING" if question["kind"] == "multi_select" else "",
                     "scoring_policy_value": "",
                     "question_text": question["prompt"]["content"] if question["prompt"] else "",
+                    "question_text_format": question["prompt"]["format"] if question["prompt"] else None,
                     "points": float(question["scoring"]["maximum_points"] or point_value),
                     "randomize_answers": question_randomize.get(key, False),
                     "options": [row["content"]["content"] for row in options],
+                    "option_formats": [row["content"]["format"] for row in options],
                     "correct_option_key": ";".join(correct_keys),
                     "correct_option_text": "",
-                    "evaluator_answer_key": answer_key,
+                    "evaluator_answer_key": answer_content["content"] if answer_content else "",
+                    "evaluator_answer_key_format": answer_content["format"] if answer_content else None,
                     "notes": "",
                     "label": "",
                     "entity_key": key,
                 }
             )
+
+    identifier_issues = target_identifier_issues(
+        [(row["question_code"], row["entity_key"]) for row in projected_questions],
+        projected_banks,
+        [(row["section_order"], row["source_bank_id"], row["entity_key"]) for row in projected_sections],
+    )
+    if identifier_issues:
+        raise ValueError(identifier_issues[0][1])
 
     projected_assets_by_key: dict[str, dict[str, Any]] = {}
     root = (asset_root or model_path.parent).resolve()
@@ -754,6 +936,14 @@ def load_authoring_projection(
         if previous and previous["sha256"] != asset["sha256"]:
             raise ValueError(f"Different assets target the same archive member path: {path_key}")
         package_path_owners[path_key] = asset
+
+    reference_issues = question_asset_reference_issues(
+        [questions[key] for key in sorted(selected_question_keys)],
+        list(projected_assets_by_key.values()),
+        resolved,
+    )
+    if reference_issues:
+        raise ValueError(reference_issues[0][1])
 
     if trial_authorization is not None and selected_question_keys != authorized_question_keys:
         missing = sorted(selected_question_keys - authorized_question_keys)

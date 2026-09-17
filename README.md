@@ -1,9 +1,5 @@
 # Brightspace Quiz Bundle
 
-This public repository is the sanitized runtime-distribution surface. The
-broader development history and evidence corpus remain private; neither is
-required to install or run this release.
-
 Brightspace Quiz Bundle is the portable producer for **Quiz Binder**, presented
 in the terminal as **Quiz Workshop**. Its ordinary workflow is:
 
@@ -77,6 +73,29 @@ until the exact result passes the pinned registry.
 See [the terminal workflow](docs/TERMINAL_WORKFLOW.md) and
 [installation guide](INSTALL.md).
 
+## Fresh question drafts
+
+For a new quiz or library, start from
+[blank.xlsx](workspace/reference/examples/quiz_draft/blank.xlsx). The separate
+deterministic intake command accepts the versioned XLSX or JSON format:
+
+```bash
+.venv/bin/python scripts/quiz_draft_intake.py my-draft.xlsx \
+  --output-dir output/my-new-draft
+```
+
+Declare question types, keyed responses, pools, draw counts and points explicitly.
+The adapter preserves supplied feedback and content formats and reports
+invalid fields without guessing or using an AI model. Successful intake produces
+an unapproved canonical draft and report; it does not authorize package building.
+This command is separate from the existing revision-focused guided terminal.
+
+See the [intake contract and limits](docs/project/quiz-consolidation/DETERMINISTIC_QUIZ_DRAFT_INTAKE_2026-09-16.md)
+and [package fidelity gates](docs/project/quiz-consolidation/QUIZ_PROJECTION_FIDELITY_GATES_2026-09-16.md).
+The included nine-type examples are synthetic. Rebuilding the template layout
+uses the optional Node authoring tool in Workbench; it is not required or shipped
+for runtime intake. Word parsing and typed-equation conversion remain future work.
+
 ## Advanced synthetic proof
 
 The earlier full-screen Bindery Ledger remains as an advanced, synthetic
@@ -100,8 +119,8 @@ its byte-pinned producer files locally; it does not call or require access to
 the private Workbench repository at runtime. The exact upstream commit and
 carried file digests are recorded in `upstream/workbench_pin.json`.
 
-The public archive is intentionally runtime-minimized. It includes only the
-synthetic fixtures required by its built-in proof, not the broader private
+The public archive is intentionally runtime-minimized. It includes synthetic
+draft templates and the fixtures required by its built-in proof, not the broader private
 development corpus or any real course export.
 
 ## Verification

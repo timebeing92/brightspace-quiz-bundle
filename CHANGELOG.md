@@ -1,5 +1,25 @@
 # Release changes
 
+## 0.1.0-rc.8 — 2026-09-17
+
+- Show source question types and preserve choice identity, rich response content
+  and bounded QTI scoring defaults during extraction and normalization.
+- Add a separate deterministic XLSX/JSON fresh-draft intake command, synthetic
+  templates, explicit question types, pools, draw counts, points and feedback.
+  Valid intake remains unapproved and extraction-only.
+- Refuse target identifier collisions, unresolved source projection, unsupported
+  feedback loss and missing or ambiguous rich-content assets before building.
+- Preserve explicit HTML/XHTML and safely escape declared plain text, including
+  prompts, options and evaluator keys. Account for MathML fallback images and
+  refuse unsupported base-URL changes without rewriting authored content.
+- Ship the versioned draft contracts and operator guidance through the public
+  runtime allowlist; retain the guided Quiz Workshop and existing synthetic TUI.
+
+Workbench producer: `a2ceeff6955cf015f93fba761cbe57846aa92613`.
+This release does not add Word intake, typed-equation conversion, a real-workflow
+full-screen TUI, new quiz serializers, automatic approval or Brightspace import
+and rendering evidence. Course-specific reviewer layouts remain downstream.
+
 ## 0.1.0-rc.7 — 2026-09-15
 
 - Finalize the guided Quiz Workshop with direct resumption of ready Rebind

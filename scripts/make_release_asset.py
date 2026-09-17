@@ -36,6 +36,8 @@ STATIC_FILES = (
     "docs/SYNTHETIC_JOURNEY.md",
     "docs/TERMINAL_WORKFLOW.md",
     "docs/UNBIND_TERMINAL.md",
+    "docs/project/quiz-consolidation/DETERMINISTIC_QUIZ_DRAFT_INTAKE_2026-09-16.md",
+    "docs/project/quiz-consolidation/QUIZ_PROJECTION_FIDELITY_GATES_2026-09-16.md",
     "docs/reference/quiz_progress_draft.schema.json",
     "sbom/runtime.cdx.json",
     "upstream/workbench_pin.json",
@@ -65,6 +67,9 @@ PUBLIC_FIXTURE_PREFIXES = (
     "tests/fixtures/quiz_authoring/",
     "tests/fixtures/quiz_xml/mixed_inline_itemref_and_root_bank/",
 )
+# These checked-in examples are synthetic fresh-intake templates, not course
+# banks. The optional Node template generator remains in Workbench.
+PUBLIC_DRAFT_TEMPLATE_PREFIX = "workspace/reference/examples/quiz_draft/"
 
 
 class ReleaseError(RuntimeError):
@@ -106,6 +111,7 @@ def release_files(pin: dict) -> list[str]:
             or target
             == "workspace/reference/schemas/course/component_package_receipt_schema.json"
             or target.startswith(PUBLIC_FIXTURE_PREFIXES)
+            or target.startswith(PUBLIC_DRAFT_TEMPLATE_PREFIX)
         ):
             promoted.append(target)
     files = sorted(

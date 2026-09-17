@@ -1,6 +1,6 @@
 # Installation
 
-Quiz Bundle `0.1.0-rc.7` uses a local Python virtual environment and direct,
+Quiz Bundle `0.1.0-rc.8` uses a local Python virtual environment and direct,
 inspectable script entry points. It is not a background service and does not
 contact Brightspace during installation or use.
 
