@@ -1,5 +1,9 @@
 # Brightspace Quiz Bundle
 
+This public repository is the sanitized runtime-distribution surface. The
+broader development history and evidence corpus remain private; neither is
+required to install or run this release.
+
 Brightspace Quiz Bundle is the portable producer for **Quiz Binder**, presented
 in the terminal as **Quiz Workshop**. Its ordinary workflow is:
 
